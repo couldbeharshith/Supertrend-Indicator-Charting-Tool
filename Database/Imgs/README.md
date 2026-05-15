@@ -1,0 +1,1 @@
+This directory holds images for the main readme page of the repo. Only for demonstration purposes

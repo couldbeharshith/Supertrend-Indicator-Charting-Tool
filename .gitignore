@@ -1,0 +1,5 @@
+.venv
+Code/__pycache__
+Database/Temp
+Database/Logs
+.vscode/

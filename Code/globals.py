@@ -3,7 +3,7 @@ from time import time
 from pickle import load
 
 
-with open('D:\\Harshith\\Techninal analysis bot (ST indicator)\\Database\\Init Data\\Tickers.bin', 'rb') as f: 
+with open('Database/Init Data/Tickers.bin', 'rb') as f: 
     TICKERS: tuple[str] = sorted(tuple(map(lambda x: x + '.NS', load(f))))
     print(f'No. of tickers: {len(TICKERS)}')
 
@@ -16,8 +16,10 @@ PERIOD = '1y'
 INTERVAL = '1d'
 START = None
 END = None
-NEW_DATA = False
+NEW_DATA = True
 SAVE_CSV = False
+INDICATOR_LENGTHS = ((10, 1), (11, 2), (12, 3))
+
 
 DPI = 230
 FIGSIZE_INCHES = (17, 10) # in inches
