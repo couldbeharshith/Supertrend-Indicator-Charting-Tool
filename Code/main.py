@@ -1,11 +1,12 @@
 import logging
 import sys
 from functools import partial
+from pathlib import Path
 from string import Template
 from threading import Event
 
 from PyQt5.QtCore import QObject, QRunnable, QSignalBlocker, QThreadPool, Qt, pyqtSignal
-from PyQt5.QtGui import QPainter, QPixmap
+from PyQt5.QtGui import QIcon, QPainter, QPixmap
 from PyQt5.QtWidgets import (
     QApplication, QFrame, QHBoxLayout, QLabel, QLineEdit, QListWidget, QListWidgetItem, QMainWindow,
     QProgressBar, QPushButton, QSizePolicy, QStackedWidget, QTabBar, QVBoxLayout, QWidget,
@@ -436,6 +437,7 @@ def main():
     app = QApplication(sys.argv)
     app.setStyle('Fusion')
     app.setStyleSheet(STYLE)
+    app.setWindowIcon(QIcon(str(Path(__file__).with_name('assets') / 'supertrend.svg')))
     window = MainWindow()
     darken_title_bar(window)
     window.show()

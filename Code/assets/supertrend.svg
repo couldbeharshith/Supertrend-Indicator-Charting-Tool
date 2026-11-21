@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64">
+  <title>SuperTrend</title>
+  <rect x="2" y="2" width="60" height="60" rx="11" fill="#15191d" stroke="#536578" stroke-width="3"/>
+  <path d="M13 49H26V41H39V32H51V53H13Z" fill="#5fc493" fill-opacity=".24"/>
+  <path d="M13 49H26V41H39V32H51" fill="none" stroke="#5fc493" stroke-width="5" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M13 37L24 27L33 34L50 16" fill="none" stroke="#d7ecff" stroke-width="6" stroke-linecap="round" stroke-linejoin="round"/>
+</svg>
