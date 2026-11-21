@@ -1,0 +1,17 @@
+[project]
+name = "supertrend-indicator-charting-tool"
+version = "0.1.0"
+description = "Desktop charting and SuperTrend screening for NSE-listed stocks."
+readme = "README.md"
+requires-python = "==3.13.*"
+dependencies = [
+    "fastapi>=0.136.1",
+    "matplotlib==3.10.3",
+    "numpy==2.2.6",
+    "pandas==2.3.0",
+    "pillow==11.2.1",
+    "pydantic>=2.13.4",
+    "pyqt5==5.15.11",
+    "uvicorn>=0.47.0",
+    "yfinance==0.2.63",
+]

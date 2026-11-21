@@ -1,232 +1,305 @@
-# Core Modules
-import multiprocessing as mp
-import matplotlib as mat
-import contextlib as ct
-import yfinance as yf
-import pandas as pd
-import numpy as np
-import os
-
-# Sub modules
-import matplotlib.pyplot as plt
-import matplotlib.dates as mdates
-
-# External classes
-from matplotlib.collections import LineCollection
-from concurrent.futures import ProcessPoolExecutor as Executor
-
-# External functions
-from pickle import load, dump
-from functools import wraps
+import logging
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from csv import writer
-from numba import njit
+from dataclasses import dataclass
+from datetime import date, datetime
+from pathlib import Path
+from pickle import PickleError, dump, load
+from tempfile import NamedTemporaryFile
+from threading import Event, Lock
+from time import monotonic
 
-# External vars
-from os import devnull, walk, makedirs
-from shutil import rmtree
+import matplotlib.dates as mdates
+import matplotlib.patheffects as path_effects
+import numpy as np
+import pandas as pd
+import yfinance as yf
+from matplotlib.backends.backend_agg import FigureCanvasAgg
+from matplotlib.collections import LineCollection
+from matplotlib.figure import Figure
+from matplotlib.lines import Line2D
+from PIL import Image
+from yfinance.exceptions import YFTickerMissingError
 
-# Custom classes
+from globals import (
+    CHART_BG, DATABASE, DOWN_COLOR, DPI, FIGSIZE_INCHES, INDICATOR_LENGTHS, INTERVAL,
+    PERIOD, PRICE_COLOR, RULE_COLOR, TEXT_COLOR, TICKERS, TODAY, UP_COLOR,
+)
 from SuperTrend import SuperTrend
-from FileProp import FileProp
-from typing import Callable
-
-# Global vars
-from globals import *
 
 
-mat.use('Agg')
-plt.rcParams['font.size'] = 8
+logger = logging.getLogger(__name__)
+HISTORY_DIR = DATABASE / 'Temp'
+# Older launches from the repository root wrote their history one level above it.
+LEGACY_HISTORY_DIR = DATABASE.parent.parent / 'Database' / 'Temp'
+PRICE_COLUMNS = ['High', 'Low', 'Close']
+price_locks = [Lock() for _ in range(64)]
+render_lock = Lock()
 
-allData: dict[str, tuple[pd.DataFrame, list[SuperTrend]]]
-uptrendTickers: list[str] = []
-err: list[str] = []
-
-def fileStructSetup() -> None:
-    makedirs('../Database/Temp', exist_ok=True)
-    todayExists, yesterdayExists = False, False
-    for dir_name in next(walk('../Database/Temp'))[1]:
-        path = f'../Database/Temp/{dir_name}'
-        date = path.split('/')[-1]
-        if date == TODAY: todayExists = True
-        elif date == YESTERDAY: yesterdayExists = True
-        else: rmtree(path)
-    if not todayExists: makedirs(f'../Database/Temp/{TODAY}')
-    if not yesterdayExists: makedirs(f'../Database/Temp/{YESTERDAY}')
-
-fileStructSetup()
-fileAllData = FileProp(f'../Database/Temp/{TODAY}/All Data/{uID}.bin')
+class ChartUnavailable(Exception):
+    pass
 
 
-def _removeSuffix(tickers: list[str]) -> list[str]: return list(map(lambda x: x[:-3], tickers))
-
-@njit(fastmath=True)
-def getEMA(data: np.ndarray, span: int) -> np.ndarray:
-    nData = len(data)
-    alpha = 2 / (span + 1)
-    ema = np.empty_like(data)
-    ema[0] = data[0]
-    for i in range(1, nData): ema[i] = alpha * data[i] + (1 - alpha) * ema[i - 1]
-    return ema
+@dataclass(frozen=True)
+class ChartResult:
+    path: Path
+    last_session: date
+    historical: bool
+    directions: tuple[bool | None, ...]
 
 
-def _suppress_output(func: Callable):
-    @wraps(func)
-    def wrapper(*args, **kwargs):
-        with ct.redirect_stdout(open(devnull, 'w')), ct.redirect_stderr(open(devnull, 'w')): return func(*args, **kwargs)
-    return wrapper
+@dataclass(frozen=True)
+class ScanResult:
+    tickers: tuple[str, ...]
+    checked: int
+    unavailable: int
 
 
-@_suppress_output
-def _downloadTickerData(ticker: str, period: str = None, interval: str ='1d', start: str = None, end: str = None) -> pd.DataFrame:
-    if period: return yf.download(ticker, period=period, interval=interval)
-    elif start and end: return yf.download(ticker, start=start, end=end, interval=interval)
-    else: raise ValueError("Check arguments provided")
+@dataclass(frozen=True)
+class TrendLine:
+    values: np.ndarray
+    rising: np.ndarray
+
+    @property
+    def last_direction(self) -> bool | None:
+        if len(self.values) < 2 or not np.isfinite(self.values[-2:]).all():
+            return None
+        return bool(self.rising[-1])
 
 
-def _getAllData() -> dict | None:
-    if NEW_DATA or not fileAllData.getSize(): return None
-    if fileAllData.fileAlreadyExists and fileAllData.getSize():
-        with open(fileAllData.filePath, 'rb') as file: return load(file)
-    return None
+def _write_cache(path, mode, write):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    file = NamedTemporaryFile(mode=mode, dir=path.parent, delete=False, newline='' if mode == 'w' else None)
+    temp_path = Path(file.name)
+    try:
+        with file:
+            write(file)
+        temp_path.replace(path)
+    finally:
+        temp_path.unlink(missing_ok=True)
 
 
-def _getTickerAllData(ticker: str) -> tuple[pd.DataFrame, list[SuperTrend]]:
-    filebin = FileProp(f'../Database/Temp/{TODAY}/Historical Data/{ticker[:-3]}_{uID}.bin')
-    
-    if NEW_DATA or not filebin.fileAlreadyExists or not filebin.getSize():
-        df = _downloadTickerData(ticker=ticker, period=PERIOD, interval=INTERVAL)
-        if df.empty: return pd.DataFrame(), []
-        
-        if isinstance(df.columns, pd.MultiIndex):
-            df.columns = df.columns.get_level_values(0)
-            df = df.loc[:,~df.columns.duplicated()]
+def _clean_prices(df):
+    if not isinstance(df, pd.DataFrame) or df.empty or not isinstance(df.index, pd.DatetimeIndex):
+        return pd.DataFrame()
+    if isinstance(df.columns, pd.MultiIndex):
+        df = df.copy()
+        df.columns = df.columns.get_level_values(0)
+        df = df.loc[:, ~df.columns.duplicated()]
+    if not set(PRICE_COLUMNS).issubset(df.columns):
+        return pd.DataFrame()
 
-        if not isinstance(df.index, pd.DatetimeIndex):
-            df.reset_index(inplace=True)
-            if 'Date' in df.columns: df.set_index('Date', inplace=True)
-        with open(filebin.filePath, 'wb') as file: dump(df, file)
-    else:
-        with open(filebin.filePath, 'rb') as file: df = load(file)
-        if not isinstance(df, pd.DataFrame): return pd.DataFrame(), []
+    prices = df[PRICE_COLUMNS].apply(pd.to_numeric, errors='coerce').replace([np.inf, -np.inf], np.nan)
+    prices = prices.loc[prices.index.notna()].dropna().sort_index()
+    return prices.loc[~prices.index.duplicated(keep='last')]
 
-    if df.empty or not all(col in df.columns for col in ['High', 'Low', 'Close']):
-        return pd.DataFrame(), []
 
-    final_df = df.copy()
-    final_df['EMA'] = getEMA(df['Close'].to_numpy(dtype=np.float32), span=5)
-    
-    indicators = [SuperTrend(df, length=i[0], multiplier=i[1], ticker=ticker) for i in INDICATOR_LENGTHS]
-    for indicator in indicators:
-        final_df = pd.concat([final_df, indicator.indicatorData], axis=1)
-        
-    return final_df, indicators
+def _history_path(ticker, cache_date, root=None):
+    root = HISTORY_DIR if root is None else root
+    return root / cache_date / 'Historical Data' / f'{ticker.removesuffix(".NS")}_{PERIOD}_{INTERVAL}_{cache_date}.bin'
+
+
+def _read_prices(path):
+    try:
+        with path.open('rb') as file:
+            return _clean_prices(load(file))
+    except (OSError, EOFError, PickleError, ValueError, ImportError, AttributeError):
+        return pd.DataFrame()
+
+
+def _cached_prices(ticker, cache_date):
+    prices = _read_prices(_history_path(ticker, cache_date))
+    if len(prices) < 2:
+        prices = _read_prices(_history_path(ticker, cache_date, LEGACY_HISTORY_DIR))
+    return prices
+
+
+def _current_prices(ticker):
+    path = _history_path(ticker, TODAY)
+    with price_locks[hash(ticker) % len(price_locks)]:
+        prices = _cached_prices(ticker, TODAY)
+        if len(prices) >= 2:
+            return prices
+
+        try:
+            history = yf.Ticker(ticker).history(period=PERIOD, interval=INTERVAL, timeout=8, raise_errors=True)
+        except YFTickerMissingError as exc:
+            logger.debug('No Yahoo Finance price history for %s: %s', ticker, exc)
+            return pd.DataFrame()
+        except Exception as exc:
+            logger.warning('Yahoo Finance history request failed for %s: %s', ticker, exc)
+            return pd.DataFrame()
+        prices = _clean_prices(history)
+        if len(prices) >= 2:
+            _write_cache(path, 'wb', lambda file: dump(prices, file))
+        return prices
+
+
+def _older_prices(ticker):
+    def folder_date(name):
+        try:
+            return datetime.strptime(name, '%d-%m-%Y').date()
+        except ValueError:
+            return date.min
+
+    dates = {folder.name for root in (HISTORY_DIR, LEGACY_HISTORY_DIR) if root.is_dir()
+             for folder in root.iterdir() if folder.is_dir()}
+    today = folder_date(TODAY)
+    for cache_date in sorted(dates, key=folder_date, reverse=True):
+        if date.min < folder_date(cache_date) < today:
+            prices = _cached_prices(ticker, cache_date)
+            if len(prices) >= 2:
+                return prices, cache_date
+    raise ChartUnavailable('Yahoo Finance did not return enough price history. Select Retry to try again.')
+
+
+def _trend_lines(prices):
+    lines = []
+    for length, multiplier in INDICATOR_LENGTHS:
+        indicator = SuperTrend(prices, length=length, multiplier=multiplier).indicatorData
+        if indicator.empty:
+            lines.append(None)
+            continue
+        key = f'{length}_{multiplier}'
+        lines.append(TrendLine(indicator[f'Supertrend_{key}'].to_numpy(),
+                               indicator[f'TrendDirec_{key}'].to_numpy(dtype=bool)))
+    return lines
+
+
+def _render_chart(prices, lines, path):
+    fig = Figure(figsize=FIGSIZE_INCHES, facecolor=CHART_BG, layout='constrained')
+    FigureCanvasAgg(fig)
+    ax = fig.add_subplot(facecolor=CHART_BG)
+    fig.get_layout_engine().set(w_pad=0.27, h_pad=0.25)
+    ema = prices['Close'].ewm(span=5, adjust=False).mean()
+    price_line, = ax.plot(prices.index, ema, color=PRICE_COLOR, linewidth=2.2,
+                         label='Price (5-day EMA)', zorder=4,
+                         path_effects=[path_effects.withStroke(linewidth=3.8, foreground=CHART_BG)])
+    dates = mdates.date2num(prices.index.to_pydatetime())
+    legend = [price_line]
+    fill_alpha = 0.13
+
+    for line, width in zip(lines, (1.15, 0.9, 0.7)):
+        if line is None:
+            continue
+        points = np.column_stack((dates, line.values))
+        segments = np.stack((points[:-1], points[1:]), axis=1)
+        ax.add_collection(LineCollection(segments, colors=np.where(line.rising[1:], UP_COLOR, DOWN_COLOR),
+                                         linewidths=width, zorder=2))
+        ax.fill_between(dates, line.values, ema, where=line.rising, color=UP_COLOR,
+                        alpha=fill_alpha, interpolate=True, linewidth=0, zorder=1)
+        ax.fill_between(dates, line.values, ema, where=~line.rising, color=DOWN_COLOR,
+                        alpha=fill_alpha, interpolate=True, linewidth=0, zorder=1)
+
+    if ax.collections:
+        legend.extend([
+            Line2D([], [], color=UP_COLOR, label='SuperTrend up'),
+            Line2D([], [], color=DOWN_COLOR, label='SuperTrend down'),
+        ])
+    locator = mdates.AutoDateLocator(minticks=4, maxticks=8)
+    ax.xaxis.set_major_locator(locator)
+    ax.xaxis.set_major_formatter(mdates.ConciseDateFormatter(locator))
+    ax.yaxis.tick_right()
+    ax.yaxis.set_label_position('right')
+    ax.set_ylabel('Price (INR)', color=TEXT_COLOR, labelpad=9, fontsize=8.5)
+    ax.tick_params(colors=TEXT_COLOR, length=0, pad=6, labelsize=9)
+    for axis in (ax.xaxis, ax.yaxis):
+        axis.offsetText.set_fontsize(9)
+    ax.set_axisbelow(True)
+    ax.grid(axis='y', color=RULE_COLOR, linewidth=0.65)
+    ax.margins(x=0.012, y=0.09)
+    for spine in ax.spines.values():
+        spine.set_visible(False)
+    ax.legend(handles=legend, loc='lower left', bbox_to_anchor=(0, 1.015), ncol=len(legend),
+              frameon=False, labelcolor=TEXT_COLOR, borderaxespad=0, fontsize=8.5,
+              handlelength=1.6, handletextpad=0.55, columnspacing=1.4)
+    _write_cache(path, 'wb', lambda file: fig.savefig(file, format='png', dpi=DPI))
+
+
+def _valid_image(path):
+    try:
+        with Image.open(path) as image:
+            image.load()
+        return True
+    except (OSError, ValueError):
+        return False
+
+
+def getChart(ticker: str) -> ChartResult:
+    if ticker not in TICKERS:
+        raise ChartUnavailable('This ticker is missing from the NSE watchlist.')
+
+    prices = _current_prices(ticker)
+    cache_date = TODAY
+    if len(prices) < 2:
+        prices, cache_date = _older_prices(ticker)
+
+    lines = _trend_lines(prices)
+    directions = tuple(line.last_direction if line else None for line in lines)
+    path = HISTORY_DIR / cache_date / 'Charts' / f'{ticker}_{PERIOD}_{INTERVAL}_v4.png'
+    with render_lock:
+        if not _valid_image(path):
+            _render_chart(prices, lines, path)
+    return ChartResult(path, prices.index[-1].date(), cache_date != TODAY, directions)
 
 
 def getChartImagePath(ticker: str) -> str:
-    global tickerNum, allData
-    imgFile = FileProp(f'../Database/Temp/{TODAY}/Chart Images/{ticker}.png')
-    if imgFile.fileAlreadyExists and imgFile.getSize() > 0:
-        tickerNum += 1
-        return imgFile.filePath
-
-    data, indicators = allData[ticker]
-    
-    # --- Definitive Plotting Fix ---
-    # 1. Identify all columns we will ever need for the plot.
-    required_cols = ['EMA']
-    for ind in indicators:
-        required_cols.append(f'Supertrend_{ind.length}_{ind.multiplier}')
-        required_cols.append(f'TrendDirec_{ind.length}_{ind.multiplier}')
-    
-    # 2. Filter for columns that actually exist in the DataFrame.
-    cols_to_plot = [col for col in required_cols if col in data.columns]
-    
-    # 3. Create one single, clean DataFrame by dropping all rows with ANY NaN values.
-    # This guarantees all arrays used for plotting are aligned and valid.
-    plot_data = data[cols_to_plot].dropna()
-
-    if len(plot_data) < 2:
-        if ticker not in err: err.append(ticker)
-        tickerNum += 1
-        return imgFile.filePath
-    
-    # 4. Proceed to plot using only the guaranteed clean 'plot_data'
-    fig, ax = plt.subplots(figsize=FIGSIZE_INCHES)
-    
-    ema_clean = plot_data['EMA']
-    dates_clean = mdates.date2num(plot_data.index.to_pydatetime())
-    
-    ax.plot(plot_data.index, ema_clean, color='blue', linewidth=1.2, label='Close Price', alpha=0.85)
-
-    for indicator in indicators:
-        indID = f'{indicator.length}_{indicator.multiplier}'
-        st_col = f'Supertrend_{indID}'
-        trend_col = f'TrendDirec_{indID}'
-
-        if st_col not in plot_data.columns or trend_col not in plot_data.columns:
-            continue
-            
-        supertrend = plot_data[st_col].to_numpy()
-        trend = plot_data[trend_col].to_numpy(dtype=bool)
-        
-        # The key is that 'dates_clean', 'supertrend', and 'trend' are now all derived
-        # from the same 'plot_data' DataFrame, so they are guaranteed to have the same length.
-        segments = np.dstack([dates_clean[:-1], supertrend[:-1], dates_clean[1:], supertrend[1:]]).reshape(-1, 2, 2)
-        lc = LineCollection(segments, colors=np.where(trend[1:], 'green', 'red'), linewidths=0.6, alpha=0.5)
-        ax.add_collection(lc)
-
-        ax.fill_between(x=plot_data.index, y1=supertrend, y2=ema_clean, where=trend, color='green', alpha=FILL_ALPHA, interpolate=True)
-        ax.fill_between(x=plot_data.index, y1=supertrend, y2=ema_clean, where=~trend, color='red', alpha=FILL_ALPHA, interpolate=True)
-
-    ax.set_title(f'{ticker} Stock Price')
-    ax.legend(loc='best')
-    ax.xaxis_date()
-    fig.savefig(imgFile.filePath, dpi=DPI, bbox_inches='tight')
-    plt.close(fig)
-    return imgFile.filePath
+    return str(getChart(ticker).path)
 
 
-def _checkUptrend(ticker: str) -> bool:
-    data, indicators = allData[ticker]
-    if data.empty: return False
-    for ind in indicators:
-        key = f'TrendDirec_{ind.length}_{ind.multiplier}'
-        if key not in data.columns or pd.isna(data.at[data.index[-1], key]) or not data.at[data.index[-1], key]:
-            return False
-    return True
+def _in_uptrend(prices):
+    if len(prices) < max(length for length, _ in INDICATOR_LENGTHS):
+        return None
+    directions = [line.last_direction if line else None for line in _trend_lines(prices)]
+    return None if None in directions else all(directions)
 
 
-def _getUptrendTickers(tickers: list[str]) -> list[str]: return _removeSuffix([ticker for ticker in tickers if _checkUptrend(ticker)])
+def init(stop: Event | None = None, progress=None) -> ScanResult:
+    stop = stop if stop is not None else Event()
+    matches, unavailable, missing = [], [], []
+    checked = 0
+    next_report = 0
 
+    def record(ticker, result):
+        nonlocal checked, next_report
+        checked += 1
+        if result is True:
+            matches.append(ticker)
+        elif result is None:
+            unavailable.append(ticker)
+        if progress and (monotonic() >= next_report or (result is True and len(matches) == 1)):
+            progress(ScanResult(tuple(sorted(matches)), checked, len(unavailable)))
+            next_report = monotonic() + 0.25
 
-def _logData() -> None:
-    uptrendTickers = _getUptrendTickers(TICKERS)
-    log_dir = '../Database/Logs'
-    makedirs(log_dir, exist_ok=True)
-    with open(f'{log_dir}/UptrendTickers_{TODAY}.csv', 'w', newline='') as file:
-        w = writer(file); w.writerows([[x] for x in uptrendTickers])
-    with open(f'{log_dir}/ErrorTickers.csv', 'w', newline='') as file:
-        w = writer(file); w.writerows([[x] for x in err])
+    for ticker in TICKERS:
+        if stop.is_set():
+            break
+        prices = _cached_prices(ticker, TODAY)
+        if len(prices) < 2:
+            missing.append(ticker)
+        else:
+            record(ticker, _in_uptrend(prices))
 
+    if missing and not stop.is_set():
+        with ThreadPoolExecutor(max_workers=8) as executor:
+            def fetch(ticker):
+                return _in_uptrend(_current_prices(ticker)) if not stop.is_set() else None
 
-def init() -> None:
-    global allData, tickerNum
-    print("Initializing...")
-    loadedAllData = _getAllData()
-    if loadedAllData is None:
-        print('Downloading All Data. This may take a while...')
-        with Executor() as exec: allData = dict(zip(TICKERS, exec.map(_getTickerAllData, TICKERS)))
-        print('\nWriting Data to cache.')
-        with open(fileAllData.filePath, 'wb') as file: dump(allData, file)
-        print('Done Writing All Data.\n')
-    else: 
-        print("Loaded data from cache.")
-        allData = loadedAllData
-    tickerNum = 0
-    _logData()
-    from globals import START_TIME
-    from time import time
-    print(f'Total time taken (seconds): {time() - START_TIME}')
+            pending = {executor.submit(fetch, ticker): ticker for ticker in missing}
+            for future in as_completed(pending):
+                if stop.is_set():
+                    executor.shutdown(cancel_futures=True)
+                    break
+                record(pending[future], future.result())
+
+    tickers = tuple(sorted(matches))
+    if not stop.is_set():
+        log_dir = DATABASE / 'Logs'
+        _write_cache(log_dir / f'UptrendTickers_{TODAY}.csv', 'w',
+                     lambda file: writer(file).writerows([ticker.removesuffix('.NS')] for ticker in tickers))
+        _write_cache(log_dir / 'ErrorTickers.csv', 'w', lambda file: writer(file).writerows([ticker] for ticker in unavailable))
+    return ScanResult(tickers, checked, len(unavailable))
+
 
 if __name__ == '__main__':
     init()
