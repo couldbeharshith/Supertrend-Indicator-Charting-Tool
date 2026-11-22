@@ -30,8 +30,6 @@ from SuperTrend import SuperTrend
 
 logger = logging.getLogger(__name__)
 HISTORY_DIR = DATABASE / 'Temp'
-# Older launches from the repository root wrote their history one level above it.
-LEGACY_HISTORY_DIR = DATABASE.parent.parent / 'Database' / 'Temp'
 PRICE_COLUMNS = ['High', 'Low', 'Close']
 price_locks = [Lock() for _ in range(64)]
 render_lock = Lock()
@@ -94,9 +92,8 @@ def _clean_prices(df):
     return prices.loc[~prices.index.duplicated(keep='last')]
 
 
-def _history_path(ticker, cache_date, root=None):
-    root = HISTORY_DIR if root is None else root
-    return root / cache_date / 'Historical Data' / f'{ticker.removesuffix(".NS")}_{PERIOD}_{INTERVAL}_{cache_date}.bin'
+def _history_path(ticker, cache_date):
+    return HISTORY_DIR / cache_date / 'Historical Data' / f'{ticker.removesuffix(".NS")}_{PERIOD}_{INTERVAL}_{cache_date}.bin'
 
 
 def _read_prices(path):
@@ -108,10 +105,7 @@ def _read_prices(path):
 
 
 def _cached_prices(ticker, cache_date):
-    prices = _read_prices(_history_path(ticker, cache_date))
-    if len(prices) < 2:
-        prices = _read_prices(_history_path(ticker, cache_date, LEGACY_HISTORY_DIR))
-    return prices
+    return _read_prices(_history_path(ticker, cache_date))
 
 
 def _current_prices(ticker):
@@ -142,8 +136,7 @@ def _older_prices(ticker):
         except ValueError:
             return date.min
 
-    dates = {folder.name for root in (HISTORY_DIR, LEGACY_HISTORY_DIR) if root.is_dir()
-             for folder in root.iterdir() if folder.is_dir()}
+    dates = [folder.name for folder in HISTORY_DIR.iterdir() if folder.is_dir()] if HISTORY_DIR.is_dir() else []
     today = folder_date(TODAY)
     for cache_date in sorted(dates, key=folder_date, reverse=True):
         if date.min < folder_date(cache_date) < today:
